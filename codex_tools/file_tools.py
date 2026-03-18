@@ -1,5 +1,8 @@
 from typing import Any, Optional
 
+import anyio
+from fastmcp import Context
+
 from .common import (
     TEXT_ENCODING,
     atomic_write,
@@ -16,21 +19,29 @@ from .common import (
     resolve_anchored_edit,
     resolve_dir,
     resolve_path,
+    resolve_workspace,
     should_skip,
     timestamp_to_iso,
 )
 from .runtime import mcp
 
 
-@mcp.tool()
-def read_file(
+async def _run_with_progress(ctx: Context, func: Any, *args: Any) -> dict[str, Any]:
+    await ctx.report_progress(progress=0, total=1)
+    try:
+        return await anyio.to_thread.run_sync(func, *args)
+    finally:
+        await ctx.report_progress(progress=1, total=1)
+
+
+def _read_file_impl(
+    target_dir: str,
     path: str,
     start_line: Optional[int] = None,
     end_line: Optional[int] = None,
     include_line_hashes: bool = False,
     encoding: str = TEXT_ENCODING,
 ) -> dict[str, Any]:
-    """Read a text file from the workspace with optional line slicing."""
     if start_line is not None and start_line < 1:
         return {"ok": False, "error": "start_line must be >= 1"}
     if end_line is not None and end_line < 1:
@@ -39,7 +50,8 @@ def read_file(
         return {"ok": False, "error": "start_line must be <= end_line"}
 
     try:
-        target = resolve_path(path, must_exist=True)
+        workspace = resolve_workspace(target_dir)
+        target = resolve_path(path, workspace=workspace, must_exist=True)
         if not target.is_file():
             return {"ok": False, "error": "path not a file"}
         state = read_file_state(target, encoding)
@@ -67,7 +79,7 @@ def read_file(
 
     result = {
         "ok": True,
-        "path": display_path(target),
+        "path": display_path(target, workspace),
         "content": selected,
         "encoding": encoding,
         "version": state["version"],
@@ -82,7 +94,30 @@ def read_file(
 
 
 @mcp.tool()
-def write_file(
+async def read_file(
+    target_dir: str,
+    path: str,
+    ctx: Context,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    include_line_hashes: bool = False,
+    encoding: str = TEXT_ENCODING,
+) -> dict[str, Any]:
+    """Read a text file under `target_dir` with optional line slicing."""
+    return await _run_with_progress(
+        ctx,
+        _read_file_impl,
+        target_dir,
+        path,
+        start_line,
+        end_line,
+        include_line_hashes,
+        encoding,
+    )
+
+
+def _write_file_impl(
+    target_dir: str,
     path: str,
     content: str,
     mode: str = "replace",
@@ -90,12 +125,12 @@ def write_file(
     include_latest_on_conflict: bool = True,
     encoding: str = TEXT_ENCODING,
 ) -> dict[str, Any]:
-    """Use for file creation, full replacement, or append. Prefer `patch_file` or `anchored_edit` for most partial edits."""
     if mode not in {"create", "replace", "append"}:
         return {"ok": False, "error": "mode must be one of create/replace/append"}
 
     try:
-        target = resolve_path(path)
+        workspace = resolve_workspace(target_dir)
+        target = resolve_path(path, workspace=workspace)
         if target.exists() and target.is_dir():
             return {"ok": False, "error": "path is a directory"}
     except Exception as e:
@@ -116,6 +151,7 @@ def write_file(
                 expected_version,
                 current_version,
                 latest_content,
+                display_root=workspace,
             )
 
         if mode == "append":
@@ -130,7 +166,7 @@ def write_file(
 
     return {
         "ok": True,
-        "path": display_path(target),
+        "path": display_path(target, workspace),
         "mode": mode,
         "created": not existed,
         "previous_version": current_version,
@@ -140,7 +176,32 @@ def write_file(
 
 
 @mcp.tool()
-def patch_file(
+async def write_file(
+    target_dir: str,
+    path: str,
+    content: str,
+    ctx: Context,
+    mode: str = "replace",
+    expected_version: Optional[str] = None,
+    include_latest_on_conflict: bool = True,
+    encoding: str = TEXT_ENCODING,
+) -> dict[str, Any]:
+    """Use for file creation, full replacement, or append under `target_dir`. Prefer `patch_file` or `anchored_edit` for most partial edits."""
+    return await _run_with_progress(
+        ctx,
+        _write_file_impl,
+        target_dir,
+        path,
+        content,
+        mode,
+        expected_version,
+        include_latest_on_conflict,
+        encoding,
+    )
+
+
+def _patch_file_impl(
+    target_dir: str,
     path: str,
     old_string: str,
     new_string: str,
@@ -149,12 +210,12 @@ def patch_file(
     include_latest_on_conflict: bool = True,
     encoding: str = TEXT_ENCODING,
 ) -> dict[str, Any]:
-    """Preferred tool for small textual edits when you know the exact old text to replace."""
     if not old_string:
         return {"ok": False, "error": "old_string required"}
 
     try:
-        target = resolve_path(path, must_exist=True)
+        workspace = resolve_workspace(target_dir)
+        target = resolve_path(path, workspace=workspace, must_exist=True)
         if not target.is_file():
             return {"ok": False, "error": "path not a file"}
         state = read_file_state(target, encoding)
@@ -175,7 +236,7 @@ def patch_file(
                     return {"ok": False, "error": str(e)}
                 return {
                     "ok": True,
-                    "path": display_path(target),
+                    "path": display_path(target, workspace),
                     "occurrences": retry_occurrences,
                     "previous_version": current_version,
                     "version": compute_file_version(updated.encode(encoding)),
@@ -189,6 +250,7 @@ def patch_file(
             expected_version,
             current_version,
             latest_content,
+            display_root=workspace,
             retry_attempted=retry_attempted,
             retry_applied=False,
         )
@@ -211,7 +273,7 @@ def patch_file(
 
     return {
         "ok": True,
-        "path": display_path(target),
+        "path": display_path(target, workspace),
         "occurrences": occurrences,
         "previous_version": current_version,
         "version": compute_file_version(updated.encode(encoding)),
@@ -221,7 +283,34 @@ def patch_file(
 
 
 @mcp.tool()
-def anchored_edit(
+async def patch_file(
+    target_dir: str,
+    path: str,
+    old_string: str,
+    new_string: str,
+    ctx: Context,
+    expected_version: Optional[str] = None,
+    retry_on_conflict: bool = True,
+    include_latest_on_conflict: bool = True,
+    encoding: str = TEXT_ENCODING,
+) -> dict[str, Any]:
+    """Preferred tool for small textual edits under `target_dir` when you know the exact old text to replace."""
+    return await _run_with_progress(
+        ctx,
+        _patch_file_impl,
+        target_dir,
+        path,
+        old_string,
+        new_string,
+        expected_version,
+        retry_on_conflict,
+        include_latest_on_conflict,
+        encoding,
+    )
+
+
+def _anchored_edit_impl(
+    target_dir: str,
     path: str,
     edits: list[dict[str, Any]],
     expected_version: Optional[str] = None,
@@ -229,12 +318,12 @@ def anchored_edit(
     include_latest_on_conflict: bool = True,
     encoding: str = TEXT_ENCODING,
 ) -> dict[str, Any]:
-    """Preferred tool for line-based edits after reading with `include_line_hashes=True`; supports re-anchoring on safe conflicts."""
     if not edits:
         return {"ok": False, "error": "edits required"}
 
     try:
-        target = resolve_path(path, must_exist=True)
+        workspace = resolve_workspace(target_dir)
+        target = resolve_path(path, workspace=workspace, must_exist=True)
         if not target.is_file():
             return {"ok": False, "error": "path not a file"}
         state = read_file_state(target, encoding)
@@ -265,6 +354,7 @@ def anchored_edit(
                 expected_version,
                 current_version,
                 content if include_latest_on_conflict else None,
+                display_root=workspace,
                 retry_attempted=retry_on_conflict,
                 retry_applied=False,
                 reason="anchor mismatch",
@@ -340,7 +430,7 @@ def anchored_edit(
 
     return {
         "ok": True,
-        "path": display_path(target),
+        "path": display_path(target, workspace),
         "edits_applied": len(resolved_edits),
         "reanchored_edits": reanchored_count,
         "previous_version": current_version,
@@ -352,18 +442,43 @@ def anchored_edit(
 
 
 @mcp.tool()
-def list_dir(
+async def anchored_edit(
+    target_dir: str,
+    path: str,
+    edits: list[dict[str, Any]],
+    ctx: Context,
+    expected_version: Optional[str] = None,
+    retry_on_conflict: bool = True,
+    include_latest_on_conflict: bool = True,
+    encoding: str = TEXT_ENCODING,
+) -> dict[str, Any]:
+    """Preferred tool for line-based edits under `target_dir` after reading with `include_line_hashes=True`; supports re-anchoring on safe conflicts."""
+    return await _run_with_progress(
+        ctx,
+        _anchored_edit_impl,
+        target_dir,
+        path,
+        edits,
+        expected_version,
+        retry_on_conflict,
+        include_latest_on_conflict,
+        encoding,
+    )
+
+
+def _list_dir_impl(
+    target_dir: str,
     path: str = ".",
     recursive: bool = False,
     globs: Optional[list[str]] = None,
     max_entries: int = 200,
 ) -> dict[str, Any]:
-    """List files and directories inside the workspace."""
     if max_entries < 1:
         return {"ok": False, "error": "max_entries must be >= 1"}
 
     try:
-        target = resolve_dir(path)
+        workspace = resolve_workspace(target_dir)
+        target = resolve_dir(path, workspace=workspace)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -382,23 +497,35 @@ def list_dir(
 
     return {
         "ok": True,
-        "path": display_path(target),
+        "path": display_path(target, workspace),
         "entries": entries,
         "count": len(entries),
     }
 
 
 @mcp.tool()
-def file_info(path: str) -> dict[str, Any]:
-    """Return basic metadata for a workspace file or directory."""
+async def list_dir(
+    target_dir: str,
+    ctx: Context,
+    path: str = ".",
+    recursive: bool = False,
+    globs: Optional[list[str]] = None,
+    max_entries: int = 200,
+) -> dict[str, Any]:
+    """List files and directories under `target_dir`."""
+    return await _run_with_progress(ctx, _list_dir_impl, target_dir, path, recursive, globs, max_entries)
+
+
+def _file_info_impl(target_dir: str, path: str = ".") -> dict[str, Any]:
     try:
-        target = resolve_path(path)
+        workspace = resolve_workspace(target_dir)
+        target = resolve_path(path, workspace=workspace)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
     info = {
         "ok": True,
-        "path": display_path(target),
+        "path": display_path(target, workspace),
         "absolute_path": str(target),
         "exists": target.exists(),
     }
@@ -419,3 +546,9 @@ def file_info(path: str) -> dict[str, Any]:
     if target.is_file():
         info["version"] = compute_file_version(target.read_bytes())
     return info
+
+
+@mcp.tool()
+async def file_info(target_dir: str, ctx: Context, path: str = ".") -> dict[str, Any]:
+    """Return metadata for a file or directory under `target_dir`."""
+    return await _run_with_progress(ctx, _file_info_impl, target_dir, path)

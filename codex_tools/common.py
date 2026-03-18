@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
 TEXT_ENCODING = "utf-8"
 
 LANG_EXT_MAP = {
@@ -34,26 +33,38 @@ SKIP_DIRS = {
 }
 
 
-def display_path(path: Path) -> str:
+def resolve_workspace(target_dir: str) -> Path:
+    if not target_dir.strip():
+        raise ValueError("target_dir required")
+
+    workspace = Path(target_dir).expanduser().resolve()
+    if not workspace.exists():
+        raise FileNotFoundError("target_dir not found")
+    if not workspace.is_dir():
+        raise NotADirectoryError("target_dir not a directory")
+    return workspace
+
+
+def display_path(path: Path, workspace: Path) -> str:
     try:
-        rel_path = path.relative_to(ROOT_DIR)
+        rel_path = path.relative_to(workspace)
     except ValueError:
         return str(path)
     return str(rel_path) or "."
 
 
-def resolve_path(path: str, *, must_exist: bool = False) -> Path:
+def resolve_path(path: str, *, workspace: Path, must_exist: bool = False) -> Path:
     if not path.strip():
         raise ValueError("path required")
 
-    raw_path = Path(path)
-    target = raw_path if raw_path.is_absolute() else ROOT_DIR / raw_path
+    raw_path = Path(path).expanduser()
+    target = raw_path if raw_path.is_absolute() else workspace / raw_path
     resolved = target.resolve()
 
     try:
-        resolved.relative_to(ROOT_DIR)
+        resolved.relative_to(workspace)
     except ValueError as exc:
-        raise ValueError("path outside workspace") from exc
+        raise ValueError("path outside target_dir") from exc
 
     if must_exist and not resolved.exists():
         raise FileNotFoundError("path not found")
@@ -61,8 +72,8 @@ def resolve_path(path: str, *, must_exist: bool = False) -> Path:
     return resolved
 
 
-def resolve_dir(path: str) -> Path:
-    target = resolve_path(path, must_exist=True)
+def resolve_dir(path: str = ".", *, workspace: Path) -> Path:
+    target = resolve_path(path, workspace=workspace, must_exist=True)
     if not target.is_dir():
         raise NotADirectoryError("path not a directory")
     return target
@@ -188,6 +199,7 @@ def build_conflict_response(
     current_version: Optional[str],
     latest_content: Optional[str] = None,
     *,
+    display_root: Optional[Path] = None,
     retry_suggested: bool = True,
     retry_attempted: bool = False,
     retry_applied: bool = False,
@@ -197,7 +209,7 @@ def build_conflict_response(
         "ok": False,
         "error": reason,
         "conflict": True,
-        "path": display_path(target),
+        "path": display_path(target, display_root) if display_root else str(target),
         "expected_version": expected_version,
         "current_version": current_version,
         "retry_suggested": retry_suggested,
